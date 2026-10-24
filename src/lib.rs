@@ -217,7 +217,7 @@ pub struct NtpTimestamp(pub u64);
 
 impl NtpTimestamp {
     /// Returns the local machine's realtime clock as an NTP timestamp.
-    pub(crate) fn now() -> Self {
+    pub fn now() -> Self {
         let since_epoch = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
