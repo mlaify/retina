@@ -54,6 +54,21 @@ jobs:
         if: matrix.rust == 'stable'
         run: cargo clippy --all-features --workspace -- -D warnings
 
+  docs:
+    name: Check docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+      - name: Build docs (all features, as on docs.rs)
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings --cfg docsrs
+
   license:
     name: Check copyright/license headers
     runs-on: ubuntu-latest
