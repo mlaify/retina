@@ -9,13 +9,12 @@
 //! parameters out of band—the same normal form a depacketizer produces—and
 //! pushes RTP payloads to a caller-supplied [`PayloadSink`].
 
+use super::Error;
 #[cfg(any(feature = "h264", feature = "h265"))]
 use super::VideoParametersCodec;
 use super::{
     FrameFormat, ParameterSetInsertion, PayloadFormat, Position, VideoFrameStart, VideoParameters,
 };
-use crate::Error;
-use crate::error::ErrorInt;
 
 /// Options for a [`VideoPacketizer`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -372,6 +371,12 @@ enum VideoPacketizerInner {
 #[cfg_attr(not(any(feature = "h264", feature = "h265")), allow(unused_variables))]
 impl VideoPacketizer {
     /// Creates a packetizer for a stream with the given parameters.
+    ///
+    /// Returns an [`ErrorKind::Unsupported`](super::ErrorKind::Unsupported)
+    /// error if Retina can't packetize this codec, or an
+    /// [`ErrorKind::Invalid`](super::ErrorKind::Invalid) error if `options`
+    /// are unacceptable. Either way, the stream can't be packetized with
+    /// these arguments.
     pub fn new(
         parameters: &VideoParameters,
         options: VideoPacketizerOptions,
@@ -383,10 +388,10 @@ impl VideoPacketizer {
             #[cfg(feature = "h265")]
             VideoParametersCodec::H265 { .. } => super::h265::Packetizer::new(parameters, options)
                 .map(|p| Self(VideoPacketizerInner::H265(Box::new(p)))),
-            _ => Err(wrap!(ErrorInt::InvalidArgument(format!(
+            _ => Err(Error::unsupported(format!(
                 "packetizing {} is unsupported",
                 parameters.rfc6381_codec()
-            )))),
+            ))),
         }
     }
 
@@ -421,7 +426,9 @@ impl VideoPacketizer {
     /// [`ParameterSetInsertion::Never`]). If they're the same, this does
     /// nothing, so it's fine to call before every frame.
     ///
-    /// Returns an error if the parameters are for a different codec.
+    /// Returns an [`ErrorKind::Invalid`](super::ErrorKind::Invalid) error if
+    /// the parameters are for a different codec. The packetizer keeps its
+    /// current parameters in that case.
     pub fn set_parameters(&mut self, parameters: &VideoParameters) -> Result<(), Error> {
         match self.0 {
             #[cfg(feature = "h264")]
@@ -529,9 +536,14 @@ impl VideoPacketizer {
     /// output is controlled by [`VideoPacketizerOptions::parameter_set_insertion`]
     /// instead.
     ///
-    /// Returns an error (without delivering any payloads) if the data isn't
-    /// validly framed, or (for H.264 and H.265) contains a NAL unit which
-    /// `push_unit` would discard.
+    /// Returns an [`ErrorKind::Invalid`](super::ErrorKind::Invalid) error if
+    /// the data isn't validly framed, or (for H.264 and H.265) contains a NAL
+    /// unit which `push_unit` would discard. Such an error is about this frame
+    /// only: nothing has been delivered to `sink`, and the packetizer is
+    /// unchanged, so the caller can drop the frame and continue with the
+    /// next. Later frames may reference the dropped one, though, so unless
+    /// it's known to be unreferenced, call [`VideoPacketizer::discontinuity`]
+    /// to drop frames until the next random access point, as for lost input.
     pub fn push_frame(
         &mut self,
         frame: VideoFrameInfo,
