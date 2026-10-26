@@ -8,7 +8,7 @@
 use bytes::{Buf as _, BufMut as _, BytesMut};
 use futures::{Sink, Stream};
 use std::time::Instant;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use url::Host;
 
@@ -34,9 +34,83 @@ const DEFAULT_READ_CAPACITY: usize = 64 * 1024;
 /// accepted, so the buffer may exceed this briefly.
 const WRITE_HIGH_WATER: usize = 4 * 1024;
 
+/// The byte stream under a [`Connection`].
+enum Io {
+    /// A TCP connection Retina established itself.
+    Tcp(TcpStream),
+
+    /// A stream from a caller-supplied [`crate::client::Connector`], e.g. TLS.
+    Custom(Box<dyn crate::client::AsyncStream>),
+}
+
+impl Io {
+    /// Reads into `first`, then `second`, returning the bytes read (0 at EOF).
+    fn poll_read(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        first: &mut [u8],
+        second: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self {
+            Io::Tcp(s) => loop {
+                // Vectored I/O fills both halves of the ring at once.
+                futures::ready!(s.poll_read_ready(cx))?;
+                let mut bufs = [
+                    std::io::IoSliceMut::new(first),
+                    std::io::IoSliceMut::new(second),
+                ];
+                match s.try_read_vectored(&mut bufs) {
+                    // Spurious readiness; re-register and wait.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    r => return std::task::Poll::Ready(r),
+                }
+            },
+            Io::Custom(s) => {
+                let buf = if first.is_empty() { second } else { first };
+                let mut buf = ReadBuf::new(buf);
+                futures::ready!(std::pin::Pin::new(s).poll_read(cx, &mut buf))?;
+                std::task::Poll::Ready(Ok(buf.filled().len()))
+            }
+        }
+    }
+}
+
+impl AsyncWrite for Io {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Io::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Io::Custom(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Io::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Io::Custom(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Io::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Io::Custom(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 /// A RTSP connection which implements `Stream`, `Sink`, and `Unpin`.
 pub(crate) struct Connection {
-    stream: TcpStream,
+    stream: Io,
     ctx: ConnectionContext,
     parser: crate::rtsp::parse::Parser,
     read_buf: MarkBuf,
@@ -127,15 +201,41 @@ impl Connection {
         stream: TcpStream,
         max_message_size: usize,
     ) -> Result<Self, std::io::Error> {
-        let established_wall = WallTime::now();
         let local_addr = stream.local_addr()?;
         let peer_addr = stream.peer_addr()?;
-        Ok(Self {
+        Ok(Self::new(
+            Io::Tcp(stream),
+            local_addr,
+            peer_addr,
+            max_message_size,
+        ))
+    }
+
+    /// Wraps a stream from a caller-supplied [`crate::client::Connector`].
+    pub(crate) fn from_transport(
+        transport: crate::client::ConnectedStream,
+        max_message_size: usize,
+    ) -> Self {
+        Self::new(
+            Io::Custom(transport.stream),
+            transport.local_addr,
+            transport.peer_addr,
+            max_message_size,
+        )
+    }
+
+    fn new(
+        stream: Io,
+        local_addr: std::net::SocketAddr,
+        peer_addr: std::net::SocketAddr,
+        max_message_size: usize,
+    ) -> Self {
+        Self {
             stream,
             ctx: ConnectionContext {
                 local_addr,
                 peer_addr,
-                established_wall,
+                established_wall: WallTime::now(),
             },
             parser: crate::rtsp::parse::Parser::builder()
                 .max_message_size(max_message_size)
@@ -145,7 +245,7 @@ impl Connection {
             written: 0,
             write_failed: None,
             write_waiters: Vec::new(),
-        })
+        }
     }
 
     pub(crate) fn ctx(&self) -> &ConnectionContext {
@@ -388,31 +488,11 @@ impl Stream for Connection {
                 }
             }
 
-            // Need more data. Read from the stream into the ring buffer
-            // using vectored I/O to fill both halves of the ring.
-            match this.stream.poll_read_ready(cx) {
-                std::task::Poll::Ready(Ok(())) => {}
-                std::task::Poll::Ready(Err(error)) => {
-                    let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
-                    return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::RtspReadError {
-                        conn_ctx: this.ctx,
-                        msg_ctx: RtspMessageContext {
-                            pos,
-                            received_wall: WallTime::now(),
-                            received: Instant::now(),
-                        },
-                        source: error,
-                    }))));
-                }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
+            // Need more data. Read from the stream into the ring buffer.
             let (first, second) = this.read_buf.spare_capacity(4096);
-            let mut bufs = [
-                std::io::IoSliceMut::new(first),
-                std::io::IoSliceMut::new(second),
-            ];
-            match this.stream.try_read_vectored(&mut bufs) {
-                Ok(0) => {
+            match this.stream.poll_read(cx, first, second) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Ok(0)) => {
                     // EOF. Try decode with eof=true.
                     return match try_decode(&mut this.parser, &mut this.read_buf, true) {
                         Ok(Some(msg)) => std::task::Poll::Ready(Some(Ok(msg))),
@@ -425,15 +505,11 @@ impl Stream for Connection {
                         )))),
                     };
                 }
-                Ok(n) => {
+                std::task::Poll::Ready(Ok(n)) => {
                     this.read_buf.advance_end(n);
                     // Loop to try decoding again.
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Spurious readiness; re-register and wait.
-                    continue;
-                }
-                Err(error) => {
+                std::task::Poll::Ready(Err(error)) => {
                     let pos = this.parser.stream_pos() + this.read_buf.unparsed_len() as u64;
                     return std::task::Poll::Ready(Some(Err(wrap!(ErrorInt::RtspReadError {
                         conn_ctx: this.ctx,

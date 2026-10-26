@@ -1,5 +1,10 @@
 ## unreleased
 
+*   add `SessionOptions::connector`, which establishes RTSP connections in
+    place of Retina's own TCP connect, and accept `rtsps` URLs when one is
+    set. This lets callers run RTSP over TLS with their choice of TLS library
+    and certificate verification (e.g. a pinned CA). The connector is also
+    used for fresh `TEARDOWN` connections.
 *   H.265: treat all intra random access point (IRAP) pictures as random
     access points, not just IDR pictures. Previously CRA and BLA pictures
     were reported with `is_random_access_point() == false`, so e.g.

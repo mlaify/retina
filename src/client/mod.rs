@@ -492,6 +492,75 @@ pub struct SessionOptions {
     receiver_reports: ReceiverReportPolicy,
     bind_addr: Option<std::net::IpAddr>,
     backchannel: bool,
+    connector: Option<Arc<dyn Connector>>,
+}
+
+/// A byte stream usable as an RTSP connection: see [`ConnectedStream`].
+pub trait AsyncStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static
+{
+}
+
+impl<T> AsyncStream for T where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static
+{
+}
+
+/// A connection established by a [`Connector`]: a byte stream plus the
+/// addresses of the TCP connection beneath it.
+///
+/// The addresses are reported in errors and [`ConnectionContext`], and used
+/// as the defaults for UDP transport, as with Retina's own TCP connections.
+///
+/// [`ConnectionContext`]: crate::ConnectionContext
+pub struct ConnectedStream {
+    pub(crate) stream: Box<dyn AsyncStream>,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) peer_addr: SocketAddr,
+}
+
+impl ConnectedStream {
+    pub fn new(stream: impl AsyncStream, local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+        Self {
+            stream: Box::new(stream),
+            local_addr,
+            peer_addr,
+        }
+    }
+}
+
+/// Establishes RTSP connections in place of Retina's own TCP connect, e.g. to
+/// run RTSP over TLS (`rtsps` URLs) with the caller's choice of TLS library
+/// and certificate verification.
+///
+/// Retina calls this for each connection it needs: the session's own, and
+/// fresh connections to retry `TEARDOWN` (see [`TeardownPolicy`]). It's
+/// implemented for closures of the matching signature.
+pub trait Connector: Send + Sync + 'static {
+    /// Connects to the server for `url`, which has scheme `rtsp` or `rtsps`.
+    fn connect(
+        &self,
+        url: &Url,
+    ) -> Pin<Box<dyn Future<Output = Result<ConnectedStream, std::io::Error>> + Send + 'static>>;
+}
+
+impl<F> Connector for F
+where
+    F: Fn(
+            &Url,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<ConnectedStream, std::io::Error>> + Send + 'static>,
+        > + Send
+        + Sync
+        + 'static,
+{
+    fn connect(
+        &self,
+        url: &Url,
+    ) -> Pin<Box<dyn Future<Output = Result<ConnectedStream, std::io::Error>> + Send + 'static>>
+    {
+        self(url)
+    }
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
@@ -705,6 +774,17 @@ impl SessionOptions {
     /// address beside a routable one). The port is chosen by the OS.
     pub fn bind(mut self, bind_addr: Option<std::net::IpAddr>) -> Self {
         self.bind_addr = bind_addr;
+        self
+    }
+
+    /// Establishes connections with `connector` rather than a plain TCP
+    /// connection to the URL's host and port.
+    ///
+    /// This is required for `rtsps` URLs: Retina has no TLS support of its
+    /// own. [`SessionOptions::bind`] doesn't apply to the connections a
+    /// connector makes; it still applies to UDP data sockets.
+    pub fn connector(mut self, connector: impl Connector) -> Self {
+        self.connector = Some(Arc::new(connector));
         self
     }
 
@@ -1392,16 +1472,22 @@ fn backchannel_require() -> msg::HeaderValue {
 
 impl RtspConnection {
     async fn connect(url: &Url, options: &SessionOptions) -> Result<Self, Error> {
-        let host =
-            RtspConnection::validate_url(url).map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
-        let port = url.port().unwrap_or(554);
-        let inner = crate::tokio::Connection::connect(
-            host,
-            port,
-            options.get_max_message_size(),
-            options.bind_addr,
-        )
-        .await
+        let host = RtspConnection::validate_url(url, options.connector.is_some())
+            .map_err(|e| wrap!(ErrorInt::InvalidArgument(e)))?;
+        let inner = match &options.connector {
+            Some(c) => c.connect(url).await.map(|t| {
+                crate::tokio::Connection::from_transport(t, options.get_max_message_size())
+            }),
+            None => {
+                crate::tokio::Connection::connect(
+                    host,
+                    url.port().unwrap_or(554),
+                    options.get_max_message_size(),
+                    options.bind_addr,
+                )
+                .await
+            }
+        }
         .map_err(|e| wrap!(ErrorInt::ConnectError(e)))?;
         Ok(Self {
             inner,
@@ -1411,12 +1497,23 @@ impl RtspConnection {
         })
     }
 
-    fn validate_url(url: &Url) -> Result<url::Host<&str>, String> {
-        if url.scheme() != "rtsp" {
-            return Err(format!(
-                "Bad URL {}; only scheme rtsp supported",
-                url.as_str()
-            ));
+    /// Checks `url`; `rtsps` is accepted only `with_connector`.
+    fn validate_url(url: &Url, with_connector: bool) -> Result<url::Host<&str>, String> {
+        match url.scheme() {
+            "rtsp" => {}
+            "rtsps" if with_connector => {}
+            "rtsps" => {
+                return Err(format!(
+                    "Bad URL {}; scheme rtsps requires SessionOptions::connector",
+                    url.as_str()
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "Bad URL {}; only schemes rtsp and rtsps supported",
+                    url.as_str()
+                ));
+            }
         }
         if url.username() != "" || url.password().is_some() {
             // Url apparently doesn't even have a way to clear the credentials,
@@ -4430,6 +4527,113 @@ mod tests {
         assert_too_large(
             describe_raw(SessionOptions::default().max_message_size(len - 1), resp).await,
         );
+    }
+
+    /// A connector which hands out `stream` once, as if connected from
+    /// `local` to `peer`.
+    fn one_shot_connector(stream: tokio::io::DuplexStream) -> impl Connector {
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 40000);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 322);
+        let stream = Mutex::new(Some(stream));
+        move |_url: &Url| {
+            let s = stream.lock().unwrap().take();
+            Box::pin(async move {
+                s.map(|s| ConnectedStream::new(s, local, peer))
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, "used"))
+            }) as Pin<Box<dyn Future<Output = _> + Send>>
+        }
+    }
+
+    /// An `rtsps` URL goes through the connector, which supplies the stream.
+    #[tokio::test]
+    async fn describe_rtsps_via_connector() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        init_logging();
+        let (client, mut server) = tokio::io::duplex(1 << 16);
+        let (mut head, body) = response(include_bytes!("testdata/reolink_describe.txt"));
+        head.headers.insert(
+            msg::HeaderName::CSEQ,
+            msg::HeaderValue::try_from("1").unwrap(),
+        );
+        let mut resp = Vec::new();
+        OwnedMessage::Response { head, body }
+            .write(&mut resp)
+            .unwrap();
+        let serve = async move {
+            let mut req = Vec::new();
+            while !req.ends_with(b"\r\n\r\n") {
+                let mut buf = [0u8; 1024];
+                let n = server.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "client hung up before sending its request");
+                req.extend_from_slice(&buf[..n]);
+            }
+            assert!(
+                req.starts_with(b"DESCRIBE rtsps://10.0.0.2:322/camera RTSP/1.0\r\n"),
+                "{}",
+                String::from_utf8_lossy(&req)
+            );
+            // Dribble the response a few bytes at a time to exercise partial reads.
+            for chunk in resp.chunks(7) {
+                server.write_all(chunk).await.unwrap();
+            }
+            server
+        };
+        let url = Url::parse("rtsps://10.0.0.2:322/camera").unwrap();
+        let options = SessionOptions::default().connector(one_shot_connector(client));
+        let (session, _server) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Session::describe(url, options),
+            ),
+            serve,
+        );
+        let session = session.unwrap().unwrap();
+        assert_eq!(session.streams().len(), 2);
+    }
+
+    /// A connector's error is reported as a connect error.
+    #[tokio::test]
+    async fn connector_error() {
+        init_logging();
+        let (client, _server) = tokio::io::duplex(64);
+        let connector = one_shot_connector(client);
+        drop(connector.connect(&Url::parse("rtsps://h/").unwrap()).await);
+        let url = Url::parse("rtsps://10.0.0.2:322/camera").unwrap();
+        let e = Session::describe(url, SessionOptions::default().connector(connector))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(*e.0, ErrorInt::ConnectError(_)), "{e}");
+    }
+
+    /// Without a connector, `rtsps` is refused before connecting.
+    #[tokio::test]
+    async fn rtsps_requires_connector() {
+        init_logging();
+        let url = Url::parse("rtsps://10.0.0.2:322/camera").unwrap();
+        let e = Session::describe(url, SessionOptions::default())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(*e.0, ErrorInt::InvalidArgument(_)), "{e}");
+        assert!(
+            e.to_string().contains("requires SessionOptions::connector"),
+            "{e}"
+        );
+    }
+
+    /// Other schemes are refused even with a connector.
+    #[tokio::test]
+    async fn http_scheme_refused() {
+        init_logging();
+        let (client, _server) = tokio::io::duplex(64);
+        let url = Url::parse("http://10.0.0.2/camera").unwrap();
+        let options = SessionOptions::default().connector(one_shot_connector(client));
+        let e = Session::describe(url, options)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(*e.0, ErrorInt::InvalidArgument(_)), "{e}");
     }
 
     /// By default there's no limit: a 2 MiB response is accepted.
