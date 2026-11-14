@@ -1,45 +1,50 @@
-name: Bug or incorrect result
-description: Report a reproducible bug, crash, compatibility problem, false positive, false negative, or other incorrect result.
+name: Bug report
+description: Report a bug in the retina RTSP library. For a problem with one camera or RTSP server, use the interop form instead.
 title: "[Bug]: "
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        This form is public. Do not include secrets, credentials, personal data, proprietary source code, or confidential vulnerability details.
+        This form is public. Do not include camera passwords, RTSP URLs with credentials, or addresses you do not want published.
 
-        A vulnerability in this project must be reported privately from the repository's Security tab. A finding in software analyzed or displayed by this project is normally a bug report here, not a vulnerability in this project.
+        A vulnerability in retina must be reported privately from the repository's **Security** tab.
   - type: dropdown
     id: kind
     attributes:
-      label: Report type
+      label: Problem
       options:
-        - Bug or crash
-        - Installation or compatibility problem
-        - Incorrect result or false positive
-        - Missed result or false negative
-        - Performance or reliability problem
-        - Other unexpected behavior
+        - Panic or crash
+        - Incorrect parsing or depacketization
+        - Connection, session, or transport problem
+        - API behaves differently from its documentation
+        - Build or compile problem
+        - Performance problem
+        - Other
     validations:
       required: true
   - type: input
     id: version
     attributes:
-      label: Version or commit
-      description: Provide the release version, build number, or commit SHA.
+      label: retina version or commit
     validations:
       required: true
   - type: input
-    id: environment
+    id: toolchain
     attributes:
-      label: Environment
-      description: Include the operating system, architecture, runtime, relevant dependencies, device, or client versions.
+      label: Rust toolchain and OS
+      description: The output of `rustc --version`, and the target OS and architecture.
     validations:
       required: true
+  - type: input
+    id: peer
+    attributes:
+      label: RTSP peer
+      description: Camera or server make, model, and firmware version, if the problem involves one.
   - type: textarea
     id: summary
     attributes:
       label: What happened?
-      description: Describe the actual behavior and why it is incorrect.
     validations:
       required: true
   - type: textarea
@@ -51,16 +56,16 @@ body:
   - type: textarea
     id: reproduce
     attributes:
-      label: Minimal reproduction
-      description: Give complete steps and the smallest safe example that reproduces the problem.
+      label: How to reproduce
+      description: If possible, a command using the example client, for example `cargo run --package client mp4 -- --url rtsp://192.0.2.10/ out.mp4`, or a minimal code sample.
     validations:
       required: true
   - type: textarea
-    id: evidence
+    id: logs
     attributes:
-      label: Sanitized logs or evidence
-      description: Remove secrets, credentials, personal data, proprietary source, and third-party data before posting.
-      render: shell
+      label: Sanitized log output
+      description: Run with `RUST_LOG=debug` if you can. Remove credentials and private addresses first.
+      render: text
   - type: checkboxes
     id: confirmations
     attributes:
@@ -68,7 +73,5 @@ body:
       options:
         - label: I searched existing open and closed issues for this problem.
           required: true
-        - label: This report does not contain confidential vulnerability details, secrets, credentials, personal data, or proprietary source code.
-          required: true
-        - label: I understand that an incorrect or disputed security result is normally a public bug report, not a vulnerability in this project.
+        - label: This report does not contain credentials or personal data.
           required: true

@@ -1,0 +1,56 @@
+name: Interop issue
+description: Report a compatibility problem with a specific RTSP peer, such as a camera or RTSP server.
+labels: ["interop"]
+title: "[Interop]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form is public. Do not include camera passwords, RTSP URLs with credentials, serial numbers, or addresses you do not want published.
+
+        A vulnerability in retina must be reported privately from the repository's **Security** tab.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Short summary
+    validations:
+      required: true
+  - type: input
+    id: peer
+    attributes:
+      label: RTSP peer
+      description: Make, model, and firmware version of the camera or server.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: retina version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: If possible, a command using the example client, for example `cargo run --package client mp4 -- --url rtsp://192.0.2.10/ out.mp4`. Otherwise, example code.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized retina log output
+      description: Run with `RUST_LOG=debug` if you can. Remove credentials and private addresses first.
+      render: text
+  - type: markdown
+    attributes:
+      value: |
+        A packet capture (`.pcap` or `.pcapng`) helps a lot. Attach one only after checking that it contains no credentials or private data, because attachments here are public.
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing open and closed issues for this peer.
+          required: true
+        - label: This report and its attachments contain no credentials or personal data.
+          required: true
